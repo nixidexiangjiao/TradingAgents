@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0d10" />
+  <title>TradingAgents · 看板</title>
+  <link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+  <!-- 顶部状态栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📈</span>
+      <span class="title">TradingAgents</span>
+    </div>
+    <div class="topbar-actions">
+      <span class="status-dot live" title="Hermes 网关在线"></span>
+      <span class="status-text">在线</span>
+    </div>
+  </header>
+
+  <!-- 主内容 -->
+  <main id="page-root" class="page-root">
+    <!-- 默认进首页（看板） -->
+  </main>
+
+  <!-- 底部 Tab 栏（5 个页面） -->
+  <nav class="tabbar">
+    <a class="tab" data-route="dashboard" href="#/dashboard">
+      <span class="tab-icon">🏠</span>
+      <span class="tab-label">看板</span>
+    </a>
+    <a class="tab" data-route="watchlist" href="#/watchlist">
+      <span class="tab-icon">⭐</span>
+      <span class="tab-label">关注</span>
+    </a>
+    <a class="tab" data-route="jobs" href="#/jobs">
+      <span class="tab-icon">⏰</span>
+      <span class="tab-label">任务</span>
+    </a>
+    <a class="tab" data-route="report" href="#/report">
+      <span class="tab-icon">📑</span>
+      <span class="tab-label">报告</span>
+    </a>
+    <a class="tab" data-route="ask" href="#/ask">
+      <span class="tab-icon">💬</span>
+      <span class="tab-label">问 Hermes</span>
+    </a>
+  </nav>
+
+  <!-- 路由 / 数据 / 渲染 -->
+  <script src="js/api.js"></script>
+  <script src="js/router.js"></script>
+  <script src="js/pages/dashboard.js"></script>
+  <script src="js/pages/watchlist.js"></script>
+  <script src="js/pages/jobs.js"></script>
+  <script src="js/pages/report.js"></script>
+  <script src="js/pages/ask.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

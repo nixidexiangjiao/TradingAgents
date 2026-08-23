@@ -1,0 +1,5 @@
+# TradingAgents H5 后端依赖（独立 venv，不污染 TradingAgents venv）
+fastapi>=0.141
+uvicorn[standard]>=0.52
+yfinance>=1.4
+pydantic>=2

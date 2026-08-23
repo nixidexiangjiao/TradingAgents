@@ -1,0 +1,16 @@
+# TradingAgents H5 — runtime 产物（不入库）
+.venv-demo/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# SQLite 数据 + 日志（不跟代码走，每台机器自己建）
+data/ta_h5.db
+data/ta_h5.db-*
+data/server.log
+data/run_*.log
+
+# local-only 配置
+.env
+*.local
