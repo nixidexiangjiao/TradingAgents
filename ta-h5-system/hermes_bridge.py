@@ -11,10 +11,12 @@ Hermes cron 包装层
   - hermes 是个 subprocess，调用要 timeout
   - 文本解析要稳（hermes 输出格式变了整个 endpoint 都会挂）
 """
+import os
 import re
 import json
 import time
 import subprocess
+import shutil
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -33,7 +35,6 @@ _CACHE = {
 
 def _hermes_bin() -> str:
     """hermes CLI 绝对路径。subprocess 必须用绝对路径（systemd 启动时 PATH 可能不包含 ~/.local/bin）"""
-    import shutil
     found = shutil.which("hermes")
     if found:
         return found
@@ -47,10 +48,12 @@ def _hermes_bin() -> str:
 def _run_hermes(args: list[str], timeout: int = 15) -> tuple[int, str, str]:
     """调 hermes cron <args>，返回 (returncode, stdout, stderr)"""
     cmd = [_hermes_bin(), "cron"] + args
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PATH"] = env.get("PATH", "") + ":/home/lzero/.local/bin"
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            env={**__import__("os").environ, "PYTHONUNBUFFERED": "1", "PATH": os.environ.get("PATH", "") + ":/home/lzero/.local/bin"},
+            cmd, capture_output=True, text=True, timeout=timeout, env=env,
         )
         return proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired:
