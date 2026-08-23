@@ -133,12 +133,37 @@ def get_watchlist(enabled_only: bool = False, _=Depends(require_auth)):
 
 
 @app.post("/api/watchlist")
-def create_watchlist_item(item: WatchItemIn, _=Depends(require_auth)):
+def create_watchlist_item(
+    item: WatchItemIn,
+    auto_cron: bool = True,
+    cron_schedule: str = "30 21 * * 1-5",
+    cron_deliver: str = "feishu",
+    _=Depends(require_auth),
+):
+    """加 ticker 时默认自动在 hermes cron 里建对应任务（auto_cron=false 可关）
+    cron_deliver 默认 'feishu'：每个 ticker 跑完推送到飞书（看板上也能看到）"""
     try:
         new = db.create_watchlist_item(item.dict(), actor="web")
-        return new
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+    cron_result = None
+    if auto_cron and new.get("enabled", True):
+        cron_result = hermes_bridge.ensure_cron_for_symbol(
+            symbol=new["symbol"],
+            schedule=cron_schedule,
+            deliver=cron_deliver,
+        )
+        # 把 cron_id 反写到 watchlist item（下次 GET 能看到关联）
+        if cron_result.get("created") and cron_result.get("job_id"):
+            db.update_watchlist_item(new["id"], {"cron_id": cron_result["job_id"]}, actor="system")
+            new["cron_id"] = cron_result["job_id"]
+        elif cron_result.get("already"):
+            new["cron_id"] = cron_result.get("job_id")
+            cron_result["created"] = False
+
+    new["cron_link"] = cron_result
+    return new
 
 
 @app.put("/api/watchlist/{item_id}")
@@ -151,10 +176,22 @@ def update_watchlist_item(item_id: str, item: WatchItemUpdate, _=Depends(require
 
 
 @app.delete("/api/watchlist/{item_id}")
-def delete_watchlist_item(item_id: str, _=Depends(require_auth)):
-    if not db.delete_watchlist_item(item_id, actor="web"):
+def delete_watchlist_item(
+    item_id: str,
+    remove_cron: bool = True,
+    _=Depends(require_auth),
+):
+    """删 ticker 时默认同步删 hermes cron（remove_cron=false 只删 watchlist）"""
+    item = db.get_watchlist_item(item_id)
+    if not item:
         raise HTTPException(404, "not found")
-    return {"ok": True}
+    db.delete_watchlist_item(item_id, actor="web")
+
+    cron_result = None
+    if remove_cron:
+        cron_result = hermes_bridge.remove_cron_for_symbol(item["symbol"])
+
+    return {"ok": True, "cron_removed": cron_result}
 
 
 # ==================== Snapshots ====================
@@ -385,12 +422,36 @@ def delete_job(job_id: str, _=Depends(require_auth)):
     return hermes_bridge.remove_job(job_id)
 
 
-# ==================== Ask (关键词路由 PoC) ====================
+# ==================== Ask (关键词路由 PoC + Hermes LLM 升级) ====================
+ASK_CACHE = {}  # question -> (ts, answer)
+ASK_TTL = 60
+
+
 def ask_router(question: str) -> dict:
+    """自然语言 → 看数据回答。
+    策略：先用关键词路由快速回答；找不到 → 调 hermes chat one-shot 让 LLM 答。
+    真实环境 hermes 可以直接读 ../results/*.json + watchlist.db + 跑 yfinance。
+    """
     q = question.strip()
     q_lower = q.lower()
     sources = []
 
+    # 缓存命中
+    if q in ASK_CACHE and (time.time() - ASK_CACHE[q][0]) < ASK_TTL:
+        return ASK_CACHE[q][1]
+
+    # 1) 关键词快速路径
+    fast = _ask_keyword(q, q_lower)
+    if fast:
+        return fast
+
+    # 2) LLM 路径：调 hermes chat 给它上下文
+    return _ask_llm(q)
+
+
+def _ask_keyword(q: str, q_lower: str) -> Optional[dict]:
+    """纯关键词路由（不走 LLM，速度快）"""
+    sources = []
     # 找 ticker
     symbols = []
     for w in db.list_watchlist():
@@ -410,17 +471,24 @@ def ask_router(question: str) -> dict:
             lines.append(f"{status_emoji} {j['name']} — {j['schedule']} — 上次 {j.get('last_run_ts', '?')[:16]} — {j.get('last_status')}")
         gw = hermes_bridge.gateway_status()
         lines.append(f"\n网关：{'运行中' if gw.get('running') else '挂了'} (PID {gw.get('pid')}, heartbeat {gw.get('heartbeat_age_s')}s)")
-        return {"answer": "\n".join(lines), "sources": ["hermes:cron list", "hermes:cron status"]}
+        out = {"answer": "\n".join(lines), "sources": ["hermes:cron list", "hermes:cron status"], "mode": "keyword"}
+        ASK_CACHE[q] = (time.time(), out)
+        return out
 
     if "pe" in q_lower or "估值" in q:
         if not symbols:
-            return {"answer": "请告诉我查询哪只股票的 PE（例：BABA 现在 PE 多少？）", "sources": []}
+            out = {"answer": "请告诉我查询哪只股票的 PE（例：BABA 现在 PE 多少？）", "sources": [], "mode": "keyword"}
+            ASK_CACHE[q] = (time.time(), out)
+            return out
         snap = fetch_snapshot(symbols[0])
-        return {
+        out = {
             "answer": f"{symbols[0]} 当前价 {snap.get('price', 'N/A')}，涨跌 {snap.get('chgPct', 'N/A')}%。\n\n"
                       f"⚠️ 详细 PE 在 Investment Thesis 段落，去报告页查 batch。",
             "sources": [f"snapshot:{symbols[0]}", "yfinance"],
+            "mode": "keyword",
         }
+        ASK_CACHE[q] = (time.time(), out)
+        return out
 
     if symbols and re.search(r"对比|比较|跟|vs", q):
         all_reports = list_all_reports()
@@ -437,25 +505,83 @@ def ask_router(question: str) -> dict:
                 lines.append(f"• {s}（{r['name']}）— {r['date']} — **{r['label']}** — {r['summary_excerpt'] or '（无摘要）'}")
             else:
                 lines.append(f"• {s} — 无报告")
-        return {"answer": "\n".join(lines), "sources": ["api:/api/reports"]}
+        out = {"answer": "\n".join(lines), "sources": ["api:/api/reports"], "mode": "keyword"}
+        ASK_CACHE[q] = (time.time(), out)
+        return out
 
     if symbols and len(symbols) == 1:
         r_list = [r for r in list_all_reports() if r["ticker"] and r["ticker"].upper() == symbols[0].upper()]
         if r_list:
             r = r_list[0]
-            return {
+            out = {
                 "answer": f"{r['ticker']}（{r['name']}）最新报告 @ {r['date']}\n\n决策：**{r['label']}**\n\n摘要：{r['summary_excerpt']}",
                 "sources": [f"report:{r['date']}/{r['ticker']}"],
+                "mode": "keyword",
             }
+            ASK_CACHE[q] = (time.time(), out)
+            return out
 
-    return {
-        "answer": "demo 阶段支持：\n"
-                  "• 某 ticker 的当前价 / PE\n"
-                  "• 某 ticker 的最近报告\n"
-                  "• 对比两只 ticker\n"
-                  "• cron 状态 / 网关状态",
-        "sources": [],
-    }
+    return None  # 没命中，走 LLM
+
+
+def _ask_llm(question: str) -> dict:
+    """调 hermes chat one-shot 答。限制工具集 + 给数据上下文。
+    优点：hermes LLM 自己决定查哪些文件、跑啥命令。
+    缺点：一次调用 ~10-30s + 消耗 token。只在关键词路由 miss 时用。"""
+    # 准备数据上下文（小段，让 LLM 自己知道有哪些数据可看）
+    wl = db.list_watchlist()
+    recent = list_all_reports()[:5]
+    context_lines = [
+        f"当前 watchlist ({len(wl)} 个):",
+        ", ".join(f"{w['symbol']}({w['name']})" for w in wl[:10]),
+        "",
+        f"最近 5 份报告:",
+    ]
+    for r in recent:
+        context_lines.append(f"- {r['date']} {r['ticker']}: {r['label']} | {r['summary_excerpt'] or ''}")
+
+    prompt = f"""用户问题（用中文回答，简短直接）：{question}
+
+【数据上下文】
+{chr(10).join(context_lines)}
+
+【数据位置】
+- 报告全文: /home/lzero/workspace/TradingAgents/results/batch_YYYY-MM-DD.json
+- 每个 json 是 list[dict]，每个 dict 有 ticker/date/decision/elapsed_s/error/final_trade_decision(markdown)
+- watchlist: SQLite at /home/lzero/workspace/TradingAgents/ta-h5-system/data/ta_h5.db
+
+回答用户问题。如果问题问的是数据，引用具体 batch 文件名。
+"""
+
+    started = time.time()
+    try:
+        proc = subprocess.run(
+            ["/home/lzero/.local/bin/hermes", "chat", "-q", prompt,
+             "--accept-hooks", "--max-turns", "8", "-t", "file,web"],
+            capture_output=True, text=True, timeout=120,
+            env={**__import__("os").environ, "PYTHONUNBUFFERED": "1"},
+        )
+        answer = proc.stdout.strip() or proc.stderr.strip() or "(无输出)"
+        # 提取最后一段"Hermes"回答（hermes chat 输出含大量 metadata noise）
+        # 找 ╭─ ⚕ Hermes ──...╰─ 这种 block
+        m = re.search(r"╭─[^\n]*⚕[^\n]*╮\s*\n(.+?)\n╰─", answer, re.DOTALL)
+        if m:
+            answer = m.group(1).strip()
+        # 截断过长输出
+        if len(answer) > 3000:
+            answer = answer[:3000] + "\n\n… (截断，去 H5 看板看完整数据)"
+        out = {
+            "answer": answer,
+            "sources": ["hermes:chat one-shot", "results/*.json", "watchlist.db"],
+            "mode": "llm",
+            "duration_s": round(time.time() - started, 1),
+        }
+        ASK_CACHE[question] = (time.time(), out)
+        return out
+    except subprocess.TimeoutExpired:
+        return {"answer": "⏱ LLM 调用超时（>120s），请去 H5 看板直接看数据", "sources": [], "mode": "error", "duration_s": round(time.time() - started, 1)}
+    except Exception as e:
+        return {"answer": f"❌ LLM 路径失败：{e}", "sources": [], "mode": "error"}
 
 
 class AskRequest(BaseModel):

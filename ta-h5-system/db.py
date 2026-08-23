@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS watchlist (
     tags TEXT,                     -- JSON array
     target_price REAL,
     stop_loss REAL,
+    cron_id TEXT,                     -- 关联的 hermes cron job_id（自动创建时填）
     updated_at TEXT NOT NULL
 );
 
@@ -79,6 +80,12 @@ def init_db() -> None:
     """启动时跑一次，建表 + 灌入默认 watchlist"""
     with conn() as c:
         c.executescript(SCHEMA)
+        # 幂等迁移：给已存在的表加新列（CREATE TABLE IF NOT EXISTS 不会改 schema）
+        for col in ("cron_id",):
+            try:
+                c.execute(f"ALTER TABLE watchlist ADD COLUMN {col} TEXT")
+            except Exception:
+                pass  # 列已存在
         cur = c.execute("SELECT COUNT(*) AS n FROM watchlist")
         if cur.fetchone()["n"] == 0:
             log.info("首次启动，灌入默认 watchlist")
@@ -157,7 +164,7 @@ def update_watchlist_item(item_id: str, data: dict, actor: str = "web") -> Optio
         if not cur:
             return None
         merged = dict(cur)
-        for k in ("symbol", "name", "market", "currency", "icon", "notes", "target_price", "stop_loss"):
+        for k in ("symbol", "name", "market", "currency", "icon", "notes", "target_price", "stop_loss", "cron_id"):
             if k in data:
                 merged[k] = data[k]
         if "enabled" in data:
@@ -169,12 +176,12 @@ def update_watchlist_item(item_id: str, data: dict, actor: str = "web") -> Optio
         merged["updated_at"] = now
         c.execute(
             "UPDATE watchlist SET symbol=?, name=?, market=?, currency=?, icon=?, enabled=?, notes=?, "
-            "tags=?, target_price=?, stop_loss=?, sort_order=?, updated_at=? WHERE id=?",
+            "tags=?, target_price=?, stop_loss=?, sort_order=?, cron_id=?, updated_at=? WHERE id=?",
             (
                 merged["symbol"].upper(), merged["name"], merged["market"], merged["currency"],
                 merged["icon"], merged["enabled"], merged["notes"], merged["tags"],
                 merged.get("target_price"), merged.get("stop_loss"), merged["sort_order"],
-                now, item_id,
+                merged.get("cron_id"), now, item_id,
             ),
         )
         _log_action(c, actor, "update", {"id": item_id, "symbol": merged["symbol"]})

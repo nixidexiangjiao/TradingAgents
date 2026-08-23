@@ -295,6 +295,7 @@ def create_job(
     repeat: Optional[int] = None,
     no_agent: bool = False,
     workdir: Optional[str] = None,
+    skills: Optional[list[str]] = None,
 ) -> dict:
     """创建 hermes cron job
     - 跑 tradingagent 必须用 --script + --no-agent（no_agent=true 直接送 stdout）
@@ -314,6 +315,9 @@ def create_job(
         args.extend(["--repeat", str(repeat)])
     if workdir:
         args.extend(["--workdir", workdir])
+    if skills:
+        for s in skills:
+            args.extend(["--skill", s])
 
     rc, out, err = _run_hermes(args, timeout=30)
     _invalidate_cache()
@@ -329,6 +333,61 @@ def create_job(
         "stdout": out[-500:],
         "stderr": err[-500:],
     }
+
+
+# ==================== watchlist ↔ cron 联动 ====================
+# 一个 ticker 对应一个 hermes cron job，name 形如：ta-batch-<SYMBOL_NORMALIZED>
+# 例如 BABA -> ta-batch-BABA，0700.HK -> ta-batch-0700HK
+
+
+def _normalize_for_cron(symbol: str) -> str:
+    s = symbol.upper().replace(".", "").replace("-", "")
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    return s
+
+
+def find_cron_for_symbol(symbol: str) -> Optional[dict]:
+    """在 hermes cron list 里找 name=ta-batch-<SYMBOL_NORMALIZED> 的 job"""
+    target = f"ta-batch-{_normalize_for_cron(symbol)}"
+    for j in list_jobs(force=True):
+        if j.get("name") == target:
+            return j
+    return None
+
+
+def ensure_cron_for_symbol(symbol: str, schedule: str = "30 21 * * 1-5",
+                            script_name: str = "analyze_one.sh",
+                            deliver: str = "origin") -> dict:
+    """为某个 ticker 确保有 cron job。已存在 → 跳过；不存在 → 创建并返回 {created, job_id, name}
+    script_name 必须是 ~/.hermes/scripts/ 下的文件名（hermes 强制要求）"""
+    normalized = _normalize_for_cron(symbol)
+    name = f"ta-batch-{normalized}"
+    existing = find_cron_for_symbol(symbol)
+    if existing:
+        return {"created": False, "job_id": existing["id"], "name": name, "already": True}
+    r = create_job(
+        name=name,
+        schedule=schedule,
+        script=script_name,
+        no_agent=True,
+        deliver=deliver,
+    )
+    return {
+        "created": r["ok"],
+        "job_id": r.get("job_id"),
+        "name": name,
+        "stderr": r.get("stderr", ""),
+        "stdout_tail": r.get("stdout", "")[-200:],
+    }
+
+
+def remove_cron_for_symbol(symbol: str) -> dict:
+    """删除 ticker 对应的 cron"""
+    existing = find_cron_for_symbol(symbol)
+    if not existing:
+        return {"removed": False, "reason": "not found"}
+    r = remove_job(existing["id"])
+    return {"removed": r["ok"], "job_id": existing["id"], "name": existing["name"]}
 
 
 def _invalidate_cache():

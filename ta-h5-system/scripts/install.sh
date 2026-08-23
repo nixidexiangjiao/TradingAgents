@@ -14,6 +14,15 @@ fi
 echo "[install] 装依赖 ..."
 "$HERE/.venv-demo/bin/pip" install -q -r "$HERE/requirements.txt"
 
+# 1.5) 复制 wrapper script 到 ~/.hermes/scripts/（hermes cron 强制要求）
+SCRIPT_SRC="$HERE/scripts/analyze_one.sh"
+SCRIPT_DST="$HOME/.hermes/scripts/analyze_one.sh"
+if [ -f "$SCRIPT_SRC" ] && [ ! -f "$SCRIPT_DST" ]; then
+    echo "[install] 复制 analyze_one.sh -> ~/.hermes/scripts/ ..."
+    cp "$SCRIPT_SRC" "$SCRIPT_DST"
+    chmod +x "$SCRIPT_DST"
+fi
+
 # 2) systemd user unit
 mkdir -p ~/.config/systemd/user
 cp "$HERE/systemd/ta-h5.service" ~/.config/systemd/user/
