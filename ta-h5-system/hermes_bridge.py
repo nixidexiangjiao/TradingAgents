@@ -149,7 +149,8 @@ def _parse_list_output(text: str) -> list[dict]:
 
 
 def list_jobs(force: bool = False) -> list[dict]:
-    """调 hermes cron list，5s 缓存。返回标准化后的 job 列表"""
+    """调 hermes cron list，5s 缓存。返回标准化后的 job 列表
+    每个 job 额外补 last_run_status / last_run_ts（从 hermes cron runs 拿，因为 list parser 在 manual run 后会丢字段）"""
     now = time.time()
     if not force and (now - _CACHE["list"][0]) < _CACHE["ttl_list"]:
         return _CACHE["list"][1]
@@ -157,7 +158,6 @@ def list_jobs(force: bool = False) -> list[dict]:
     rc, out, err = _run_hermes(["list"])
     if rc != 0:
         log.warning(f"hermes cron list 失败: rc={rc} err={err[:200]}")
-        # 缓存失败时返回空，但保留时间戳避免反复打 hermes
         _CACHE["list"] = (now, [])
         return []
 
@@ -167,15 +167,43 @@ def list_jobs(force: bool = False) -> list[dict]:
         j.setdefault("name", "(unnamed)")
         j.setdefault("last_status", "unknown")
         j.setdefault("last_execution_status", "unknown")
-        # 推断 scope（按 cron name 关键词）
         j["scope"] = _infer_scope(j)
-        # 推断我们关心的字段
         j["tradingagent_related"] = (
             "tradingagent" in j.get("name", "").lower()
             or "tradingagent" in j.get("script", "").lower()
             or "baba" in j.get("name", "").lower()
             or "0700" in j.get("name", "").lower()
         )
+
+    # ⚠️ list parser 在 manual run 后会缺"Last run"行（hermes 输出格式变化），
+    # 导致 last_run_ts=None / last_status='unknown'。从 hermes cron runs 补字段。
+    for j in jobs:
+        if not j.get("last_run_ts"):
+            try:
+                runs = get_runs(j["id"], limit=1)
+                if runs:
+                    latest = runs[0]
+                    j["last_run_ts"] = latest["ts"]
+                    # runs.status: completed / failed / running / unknown
+                    rs = latest["status"]
+                    if rs == "completed":
+                        j["last_status"] = "success"
+                        j["last_execution_status"] = "completed"
+                    elif rs == "failed":
+                        j["last_status"] = "failed"
+                        j["last_execution_status"] = "failed"
+                    elif rs == "running":
+                        j["last_status"] = "running"
+                        j["last_execution_status"] = "running"
+                    else:  # unknown
+                        j["last_status"] = "unknown"
+                        j["last_execution_status"] = "unknown"
+            except Exception as e:
+                log.debug(f"补字段失败 {j['id']}: {e}")
+        # last_run_ts fallback：再没有就用 next_run
+        if not j.get("last_run_ts"):
+            j["last_run_ts"] = j.get("next_run")  # 不准确但至少有显示
+
     _CACHE["list"] = (now, jobs)
     log.info(f"hermes cron list: {len(jobs)} jobs")
     return jobs
@@ -183,6 +211,11 @@ def list_jobs(force: bool = False) -> list[dict]:
 
 def _infer_scope(job: dict) -> str:
     name = (job.get("name") or "").lower()
+    if name.startswith("ta-batch-"):
+        # ta-batch-NVDA / ta-batch-0700HK → NVDA / 0700.HK
+        normalized = name[len("ta-batch-"):]
+        symbol = _denormalize_for_display(normalized)
+        return symbol
     if "baba" in name and "0700" in name:
         return "BABA + 0700.HK"
     if "baba" in name or "9988" in name or "alibaba" in name:
@@ -194,6 +227,19 @@ def _infer_scope(job: dict) -> str:
     if "version" in name:
         return "system"
     return name or "?"
+
+
+def _denormalize_for_display(normalized: str) -> str:
+    """ta-batch-nvda → NVDA, ta-batch-0700hk → 0700.HK
+    用于 scope 显示，不参与 schedule 等逻辑。"""
+    n = normalized.upper()
+    if n.endswith("HK") and n[:-2].isdigit():
+        return n[:-2] + ".HK"
+    if n.endswith("SH") and n[:-2].isdigit():
+        return n[:-2] + ".SH"
+    if n.endswith("SZ") and n[:-2].isdigit():
+        return n[:-2] + ".SZ"
+    return n
 
 
 # ==================== 状态 ====================
@@ -258,8 +304,10 @@ def get_runs(job_id: Optional[str] = None, limit: int = 20) -> list[dict]:
 
 # ==================== 操作 ====================
 def run_now(job_id: str) -> dict:
-    """立刻跑一个 job（hermes cron run <id>）"""
-    rc, out, err = _run_hermes(["run", job_id], timeout=20)
+    """立刻跑一个 hermes cron job（hermes cron run）
+    注意：hermes cron run 是 fire-and-forget，会等 cron 完成才返回（job 跑 10 分钟它就等 10 分钟）。
+    超时设 60s——真跑超时由 hermes 接管，H5 用 /api/jobs/<id>/logs 查状态即可。"""
+    rc, out, err = _run_hermes(["run", job_id], timeout=60)
     return {
         "ok": rc == 0,
         "returncode": rc,
@@ -356,15 +404,21 @@ def find_cron_for_symbol(symbol: str) -> Optional[dict]:
 
 
 def ensure_cron_for_symbol(symbol: str, schedule: str = "30 21 * * 1-5",
-                            script_name: str = "analyze_one.sh",
-                            deliver: str = "origin") -> dict:
+                            script_name: Optional[str] = None,
+                            deliver: str = "feishu") -> dict:
     """为某个 ticker 确保有 cron job。已存在 → 跳过；不存在 → 创建并返回 {created, job_id, name}
-    script_name 必须是 ~/.hermes/scripts/ 下的文件名（hermes 强制要求）"""
+    每个 ticker 一个独立 script（analyze_one_<NORMALIZED>.sh），避免 hermes cron 不支持 script args 的限制
+    """
     normalized = _normalize_for_cron(symbol)
     name = f"ta-batch-{normalized}"
+    if script_name is None:
+        script_name = f"analyze_one_{normalized}.sh"
+    # 先确保 per-ticker script 存在（带 ticker 参数）
+    _ensure_ticker_script(symbol, normalized, script_name)
     existing = find_cron_for_symbol(symbol)
     if existing:
-        return {"created": False, "job_id": existing["id"], "name": name, "already": True}
+        return {"created": False, "job_id": existing["id"], "name": name, "already": True,
+                "script": script_name}
     r = create_job(
         name=name,
         schedule=schedule,
@@ -376,9 +430,33 @@ def ensure_cron_for_symbol(symbol: str, schedule: str = "30 21 * * 1-5",
         "created": r["ok"],
         "job_id": r.get("job_id"),
         "name": name,
+        "script": script_name,
         "stderr": r.get("stderr", ""),
         "stdout_tail": r.get("stdout", "")[-200:],
     }
+
+
+def _ensure_ticker_script(symbol: str, normalized: str, target_filename: str) -> None:
+    """在 ~/.hermes/scripts/ 生成/更新 per-ticker script：固定跑 symbol。
+    这样 hermes cron 触发时不需要传 args（hermes cron 不支持）。"""
+    target = Path(os.path.expanduser("~/.hermes/scripts")) / target_filename
+    body = f"""#!/bin/bash
+# Per-ticker wrapper: 自动跑 {symbol}
+# 由 ta-h5-system server.py 在 ensure_cron_for_symbol 时生成
+# 调用通用 analyze_one.sh 并固定 ticker 参数
+
+exec /home/lzero/.hermes/scripts/analyze_one.sh "{symbol}" "$@"
+"""
+    # 只在不存在或 symbol 不匹配时写
+    needs_write = True
+    if target.exists():
+        existing = target.read_text()
+        if f'"{symbol}"' in existing or symbol in existing:
+            needs_write = False
+    if needs_write:
+        target.write_text(body)
+        target.chmod(0o755)
+        log.info(f"wrote per-ticker script: {target}")
 
 
 def remove_cron_for_symbol(symbol: str) -> dict:

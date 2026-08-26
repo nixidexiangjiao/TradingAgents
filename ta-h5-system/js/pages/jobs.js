@@ -1,4 +1,5 @@
 // ===== 页面 3：任务中心 =====
+// ⚠️ 内部函数不要用通用名（render），会被 ask.js 覆盖。
 window.Pages.jobs = async function () {
   const root = document.getElementById("page-root");
   root.innerHTML = `<div class="empty"><div class="emoji">⏳</div>加载中…</div>`;
@@ -8,10 +9,10 @@ window.Pages.jobs = async function () {
     root.innerHTML = `<div class="empty"><div class="emoji">⚠️</div>无法连接后端<br><div class="hint">${e.message}</div></div>`;
     return;
   }
-  render();
+  renderJobs();
 };
 
-function render() {
+function renderJobs() {
   const root = document.getElementById("page-root");
   const jobs = window.API.STATE.jobs;
   root.innerHTML = `
@@ -19,10 +20,10 @@ function render() {
       <h1 class="page-title">任务中心</h1>
       <p class="page-sub">Hermes cron + TradingAgents CLI</p>
 
-      <button class="btn mb-8" id="btn-run-now">▶ 立即跑一次（按当前关注列表）</button>
+      <button class="btn mb-8" id="btn-run-now">▶ 立即跑整个 watchlist</button>
 
       <div class="card">
-        <div class="card-title mb-8">定时任务</div>
+        <div class="card-title mb-8">定时任务（点行内按钮立刻跑 / 看日志）</div>
         ${jobs.map((j) => `
           <div class="list-item" style="flex-direction:column; align-items:stretch; gap:8px;">
             <div class="row">
@@ -36,12 +37,13 @@ function render() {
               <span>📅 上次：${j.lastRun || '暂无'}</span>
               <span class="spacer"></span>
               <span>⏱ ${j.duration || '—'}</span>
-              <span class="pill ${j.lastStatus === 'success' ? 'green' : j.lastStatus === 'failed' ? 'red' : 'yellow'}" style="margin-left:8px;">${j.lastStatus === 'success' ? '成功' : j.lastStatus === 'failed' ? '失败' : '未运行'}</span>
+              <span class="pill ${j.lastStatus === 'success' ? 'green' : j.lastStatus === 'failed' ? 'red' : j.lastStatus === 'running' ? 'yellow' : j.lastStatus === 'unknown' ? 'yellow' : 'yellow'}" style="margin-left:8px;">${j.lastStatus === 'success' ? '成功' : j.lastStatus === 'failed' ? '失败' : j.lastStatus === 'running' ? '运行中' : j.lastStatus === 'unknown' ? '未知' : '未运行'}</span>
             </div>
             <div class="row" style="gap:6px;">
               <span class="pill">cron: ${j.cronId}</span>
               <div class="spacer"></div>
-              <button class="btn small secondary" onclick="alert('查看日志（demo）')">📋 日志</button>
+              <button class="btn small" data-run-job="${j.id}" data-run-name="${j.name}">▶ 立刻跑</button>
+              <button class="btn small secondary" data-logs-job="${j.id}" data-logs-name="${j.name}">📋 日志</button>
             </div>
           </div>
         `).join("")}
@@ -66,14 +68,109 @@ function render() {
         <div class="card-title mb-8">说明</div>
         <div class="muted small">
           • 定时任务由 Hermes 网关调度<br>
-          • 立即跑会调用 <code>run_batch.py</code>，写 <code>batch_YYYY-MM-DD.json</code><br>
-          • 后台异步执行，进度可看「任务日志」
+          • 立刻跑 → hermes cron run，完整 stdout 由 hermes 送飞书 deliver<br>
+          • 「📋 日志」显示 hermes cron runs 历史（状态：completed/failed/running/unknown）
         </div>
       </div>
     </div>
   `;
 
   document.getElementById("btn-run-now").addEventListener("click", runNowAndMonitor);
+
+  // 每行的 ▶ 立刻跑 按钮
+  document.querySelectorAll("[data-run-job]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const jobId = btn.dataset.runJob;
+      const name = btn.dataset.runName;
+      runSpecificJob(jobId, name);
+    });
+  });
+
+  // 每行的 📋 日志 按钮
+  document.querySelectorAll("[data-logs-job]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const jobId = btn.dataset.logsJob;
+      const name = btn.dataset.logsName;
+      openLogsSheet(jobId, name);
+    });
+  });
+}
+
+// ===== 立刻跑指定 job =====
+async function runSpecificJob(jobId, name) {
+  if (!confirm(`立刻跑 "${name}"？\n\n由 hermes cron 触发，完整日志送飞书（deliver=feishu）。\n任务可能跑 10+ 分钟，H5 看「📋 日志」查进度。`)) return;
+  try {
+    const r = await fetch("/api/jobs/run/" + encodeURIComponent(jobId), { method: "POST" });
+    const data = await r.json();
+    // hermes cron run 是 fire-and-forget，可能超时但任务已经在跑
+    if (data.ok) {
+      alert(`已触发：${name}\n\n${data.stdout || ''}`);
+    } else if (data.stderr && data.stderr.includes("timeout")) {
+      alert(`已触发（hermes cron run timeout，但任务在后台跑）：${name}\n\n去「📋 日志」看进度。`);
+    } else {
+      alert(`触发：${name}\n${JSON.stringify(data, null, 2)}`);
+    }
+  } catch (e) {
+    alert("触发失败：" + e.message);
+  }
+}
+
+// ===== 日志弹层 =====
+async function openLogsSheet(jobId, name) {
+  const overlay = document.createElement("div");
+  overlay.className = "sheet-overlay open";
+  overlay.innerHTML = `
+    <div class="sheet" onclick="event.stopPropagation()" style="max-height: 85vh;">
+      <h2>📋 日志 · ${name}</h2>
+      <p class="muted small" style="margin-top:-8px;">cron job_id: ${jobId}</p>
+      <div id="logs-list" class="muted small">加载中…</div>
+      <button class="btn secondary" style="margin-top:12px;" onclick="this.closest('.sheet-overlay').remove()">关闭</button>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+
+  const list = overlay.querySelector("#logs-list");
+  try {
+    const r = await fetch("/api/jobs/" + encodeURIComponent(jobId) + "/logs?limit=5");
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    const runs = data.runs || [];
+    if (runs.length === 0) {
+      list.innerHTML = '<div class="empty"><div class="emoji">📭</div>暂无执行历史<br><div class="hint">点「▶ 立刻跑」或等定时任务触发</div></div>';
+      return;
+    }
+    const statusPill = (s) => {
+      if (s === 'completed') return '<span class="pill green">完成</span>';
+      if (s === 'failed') return '<span class="pill red">失败</span>';
+      if (s === 'running') return '<span class="pill yellow">运行中</span>';
+      if (s === 'unknown') return '<span class="pill yellow">未知</span>';
+      return `<span class="pill">${escapeHtml(s)}</span>`;
+    };
+    list.innerHTML = runs.map((run, idx) => `
+      <div style="margin-bottom:8px; padding:10px; background: var(--bg-elev); border-radius: 6px;">
+        <div class="row" style="margin-bottom:4px;">
+          <strong style="font-size:13px;">${run.ts}</strong>
+          ${statusPill(run.status)}
+          <div class="spacer"></div>
+          <span class="muted tiny">${run.source}</span>
+        </div>
+        <div class="muted tiny">execution_id: ${escapeHtml(run.execution_id)}</div>
+      </div>
+    `).join("");
+    // 顶部加说明
+    const note = document.createElement("div");
+    note.className = "muted small";
+    note.style.marginBottom = "10px";
+    note.innerHTML = "💡 完整 stdout 由 hermes 直接送 deliver（飞书），本地不持久化。去飞书查具体输出。";
+    list.prepend(note);
+  } catch (e) {
+    list.innerHTML = `<div class="muted">加载失败：${e.message}</div>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
 async function runNowAndMonitor() {
@@ -102,7 +199,7 @@ async function runNowAndMonitor() {
         if (s.status === "completed") {
           if (log) log.textContent += `\n\n[exitCode=${s.exitCode}] ✅ 完成`;
           await window.API.refreshAll();
-          render();
+          renderJobs();
           return;
         }
       } catch (e) { /* 忽略单次失败 */ }

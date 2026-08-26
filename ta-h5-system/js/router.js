@@ -10,6 +10,7 @@ window.Router = (function () {
       "^" + pattern.replace(/:[^/]+/g, (m) => { keys.push(m.slice(1)); return "([^/]+)"; }) + "$"
     );
     routes[pattern] = { regex, keys, handler };
+    console.log("[router] registered:", pattern, "total routes:", Object.keys(routes).length);
   }
 
   function resolve() {
@@ -43,5 +44,9 @@ window.Router = (function () {
   function go(path) { location.hash = path; }
 
   window.addEventListener("hashchange", resolve);
+  // 路由切换时关闭所有打开的 sheet（避免遮挡下一页面按钮）
+  window.addEventListener("hashchange", () => {
+    document.querySelectorAll(".sheet-overlay.open").forEach((el) => el.remove());
+  });
   return { on, resolve, go };
 })();

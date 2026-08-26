@@ -15,7 +15,7 @@ RestartSec=5s
 # 但 server 调 yfinance 时也得走 proxy，所以 PATH/HOME 必须保留。
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/home/lzero
-Environment=TA_H5_HOST=127.0.0.1
+Environment=TA_H5_HOST=0.0.0.0
 Environment=TA_H5_PORT=8765
 # ⚠️ 可选鉴权（默认 off，因为只 listen 127.0.0.1，靠 Tailscale/防火墙兜底）
 # Environment=TA_H5_TOKEN=换成你的密码

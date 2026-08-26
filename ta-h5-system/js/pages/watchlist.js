@@ -1,4 +1,5 @@
 // ===== 页面 2：关注列表 =====
+// ⚠️ 内部函数不要用通用名（renderList / escapeHtml / render），会被别的 page 覆盖。
 window.Pages.watchlist = async function () {
   const root = document.getElementById("page-root");
   root.innerHTML = `<div class="empty"><div class="emoji">⏳</div>加载中…</div>`;
@@ -9,10 +10,10 @@ window.Pages.watchlist = async function () {
     return;
   }
 
-  renderList();
+  renderWatchlist();
 };
 
-function renderList() {
+function renderWatchlist() {
   const root = document.getElementById("page-root");
   const items = window.API.STATE.watchlist;
   const snapshots = window.API.STATE.snapshots;
@@ -73,7 +74,7 @@ async function toggleItem(id) {
   if (!w) return;
   try {
     await window.API.updateWatchItem(id, { ...w, enabled: !w.enabled });
-    renderList();
+    renderWatchlist();
   } catch (e) { alert("更新失败：" + e.message); }
 }
 
@@ -81,7 +82,7 @@ async function delItem(id) {
   if (!confirm("确定删除？历史报告不会受影响。")) return;
   try {
     await window.API.deleteWatchItem(id);
-    renderList();
+    renderWatchlist();
   } catch (e) { alert("删除失败：" + e.message); }
 }
 
@@ -148,7 +149,7 @@ function openSheet(editId) {
       if (editing) await window.API.updateWatchItem(editing.id, data);
       else await window.API.createWatchItem(data);
       close();
-      renderList();
+      renderWatchlist();
     } catch (e) { alert("保存失败：" + e.message); }
   });
   function close() { overlay.remove(); }

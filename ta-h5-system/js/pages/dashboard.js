@@ -49,8 +49,11 @@ window.Pages.dashboard = async function () {
         const snap = snapshots[w.symbol] || { price: "—", chgPct: 0, signal: "neutral", error: "no data" };
         const chgClass = (snap.chgPct || 0) > 0 ? "up" : (snap.chgPct || 0) < 0 ? "down" : "flat";
         const signalText = { bull: "看多", bear: "看空", neutral: "中性" }[snap.signal || "neutral"];
+        // 找到该 ticker 的最新报告 id（用于点 ticker 直接进报告详情）
+        const latest = reports.find((r) => r.ticker && r.ticker.toUpperCase() === w.symbol.toUpperCase());
+        const target = latest ? `#/report/${latest.id}` : "#/report";
         return `
-          <a class="ticker-card" href="#/report">
+          <a class="ticker-card" href="${target}">
             <span class="ticker-icon">${w.icon || "📊"}</span>
             <div class="ticker-info">
               <div class="ticker-symbol">${w.symbol} <span class="pill ${snap.signal === 'bull' ? 'green' : snap.signal === 'bear' ? 'red' : 'yellow'}">${signalText}</span></div>

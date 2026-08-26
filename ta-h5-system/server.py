@@ -46,7 +46,7 @@ if os.path.exists(_proxy_file):
             if len(kv) == 2 and kv[0] in ("http_proxy", "https_proxy", "no_proxy"):
                 os.environ[kv[0]] = kv[1].strip('"').strip("'")
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -372,8 +372,20 @@ def get_gateway(force: bool = False, _=Depends(require_auth)):
 
 @app.get("/api/jobs")
 def get_jobs(refresh: bool = False, _=Depends(require_auth)):
-    """列出 hermes cron 全部 job。refresh=true 强制重读（写操作后用）"""
-    return {"jobs": hermes_bridge.list_jobs(force=refresh)}
+    """列出 hermes cron 全部 job。refresh=true 强制重读（写操作后用）
+    返回 camelCase 别名，方便前端直接用"""
+    jobs = hermes_bridge.list_jobs(force=refresh)
+    out = []
+    for j in jobs:
+        row = dict(j)
+        # camelCase 别名
+        row["lastRun"] = j.get("last_run_ts") or j.get("next_run") or "暂无"
+        row["lastStatus"] = j.get("last_status") or "unknown"
+        row["lastStatusNote"] = j.get("last_status_note") or ""
+        row["cronId"] = j.get("id", "")[:12]
+        row["duration"] = "—"  # hermes 不存 duration
+        out.append(row)
+    return {"jobs": out}
 
 
 @app.get("/api/jobs/runs/{job_id}")
@@ -383,10 +395,30 @@ def get_job_runs(job_id: str, limit: int = 20, _=Depends(require_auth)):
 
 @app.post("/api/jobs/run/{job_id}")
 def run_job_now(job_id: str, _=Depends(require_auth)):
-    """立刻跑一个 hermes cron job（用 hermes cron run，非手动启 subprocess）"""
-    log.info(f"POST /api/jobs/run/{job_id}")
-    r = hermes_bridge.run_now(job_id)
-    return r
+    """立刻跑一个 hermes cron job。
+    ⚠️ 100% 复用 hermes：调 hermes cron run <id>，让 hermes 调度 + 执行 + 推送 deliver
+    H5 不自己 Popen script（避免重复实现 hermes 已有能力）
+    日志：hermes no-agent stdout 直接送到 deliver（飞书/telegram），本地拿不到完整 stdout。
+    H5 用 hermes cron runs 拿历史 status（status: completed/failed/running + ts）
+    """
+    log.info(f"POST /api/jobs/run/{job_id} → hermes cron run")
+    return hermes_bridge.run_now(job_id)
+
+
+# ==================== Run history (从 hermes 拿) ====================
+@app.get("/api/jobs/{job_id}/logs")
+def get_job_logs(job_id: str, limit: int = 5, _=Depends(require_auth)):
+    """拿某个 job 的最近 N 次执行历史（从 hermes cron runs 拿）
+    注意：hermes no-agent stdout 不持久化到本地，只送 deliver。日志要看完整内容得去飞书/Telegram。
+    """
+    runs = hermes_bridge.get_runs(job_id, limit=limit)
+    return {"runs": runs, "note": "完整 stdout 在 deliver 渠道（飞书/Telegram）。本地只存 execution 历史。"}
+
+
+@app.get("/api/runs/{run_id}/log")
+def get_run_log(run_id: str, _=Depends(require_auth)):
+    """单次执行的日志（hermes no-agent 不持久化，404）"""
+    raise HTTPException(404, "hermes no-agent stdout 不持久化本地。请去飞书/Telegram 查 deliver 消息。")
 
 
 @app.post("/api/jobs/create")
@@ -630,6 +662,8 @@ app.mount("/js", StaticFiles(directory=APP_DIR / "js"), name="js")
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("TA_H5_PORT", "8765"))
-    host = os.environ.get("TA_H5_HOST", "127.0.0.1")  # 默认仅本机，外部走 Tailscale
+    # 默认 listen 0.0.0.0（让手机 LAN / Tailscale 都能直接访问）
+    # 若想只 listen 本机（更安全），设 TA_H5_HOST=127.0.0.1
+    host = os.environ.get("TA_H5_HOST", "0.0.0.0")
     log.info(f"TradingAgents H5 starting on {host}:{port} (auth={'on' if TA_H5_TOKEN else 'off'})")
     uvicorn.run(app, host=host, port=port, log_level="info")
