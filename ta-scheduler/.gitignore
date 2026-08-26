@@ -1,0 +1,11 @@
+# TradingAgents Scheduler — runtime 产物（不入库）
+state.db
+state.db-journal
+state.db-shm
+state.db-wal
+logs/
+*.pyc
+__pycache__/
+
+# 测试用临时文件
+/tmp_*

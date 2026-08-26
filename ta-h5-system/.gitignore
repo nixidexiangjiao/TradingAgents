@@ -14,3 +14,4 @@ data/run_*.log
 # local-only 配置
 .env
 *.local
+ta-h5-system/data/server.out
