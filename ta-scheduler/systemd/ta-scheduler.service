@@ -1,0 +1,17 @@
+[Unit]
+Description=TradingAgents Scheduler — independent scheduler (no hermes cron)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/lzero/workspace/TradingAgents/.venv/bin/python /home/lzero/workspace/TradingAgents/ta-scheduler/scheduler.py
+WorkingDirectory=/home/lzero/workspace/TradingAgents/ta-scheduler
+Restart=on-failure
+RestartSec=10s
+StandardOutput=append:/home/lzero/workspace/TradingAgents/ta-scheduler/logs/scheduler.log
+StandardError=append:/home/lzero/workspace/TradingAgents/ta-scheduler/logs/scheduler.log
+# 不需要 hermes gateway / 没有 hermes 依赖
+
+[Install]
+WantedBy=default.target
