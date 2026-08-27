@@ -18,7 +18,7 @@ function renderJobs() {
   root.innerHTML = `
     <div class="page">
       <h1 class="page-title">任务中心</h1>
-      <p class="page-sub">Hermes cron + TradingAgents CLI</p>
+      <p class="page-sub">ta-scheduler + TradingAgents CLI</p>
 
       <button class="btn mb-8" id="btn-run-now">▶ 立即跑整个 watchlist</button>
 
@@ -50,7 +50,7 @@ function renderJobs() {
       </div>
 
       <div class="card">
-        <div class="card-title mb-8">执行历史（最近报告）</div>
+        <div class="card-title mb-8">最近 5 份分析报告（来自 results/batch_*.json）</div>
         ${(window.API.STATE.reports || []).slice(0, 5).map((r) => `
           <div class="row" style="padding: 6px 0; border-top: 1px solid var(--border);">
             <span class="signal ${r.signal === 'bull' ? 'bull' : r.signal === 'bear' ? 'bear' : 'neutral'}">
@@ -67,9 +67,9 @@ function renderJobs() {
       <div class="card">
         <div class="card-title mb-8">说明</div>
         <div class="muted small">
-          • 定时任务由 Hermes 网关调度<br>
-          • 立刻跑 → hermes cron run，完整 stdout 由 hermes 送飞书 deliver<br>
-          • 「📋 日志」显示 hermes cron runs 历史（状态：completed/failed/running/unknown）
+          • 调度由 ta-scheduler 负责（独立 Python 进程，跟 hermes 无关）<br>
+          • 立刻跑 → 直接调 run_batch.py，同步等结果（10+ 分钟）<br>
+          • 「📋 日志」显示状态（pending/completed/failed）+ 最近一次错误
         </div>
       </div>
     </div>
@@ -86,6 +86,14 @@ function renderJobs() {
     });
   });
 
+  // 每行的 📜 看完整日志 按钮
+  document.querySelectorAll("[data-load-full-log]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const runId = btn.dataset.loadFullLog;
+      openFullLogSheet(runId);
+    });
+  });
+
   // 每行的 📋 日志 按钮
   document.querySelectorAll("[data-logs-job]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -98,17 +106,17 @@ function renderJobs() {
 
 // ===== 立刻跑指定 job =====
 async function runSpecificJob(jobId, name) {
-  if (!confirm(`立刻跑 "${name}"？\n\n由 hermes cron 触发，完整日志送飞书（deliver=feishu）。\n任务可能跑 10+ 分钟，H5 看「📋 日志」查进度。`)) return;
+  if (!confirm(`立刻跑 "${name}"？\n\n后台调 run_batch.py（10+ 分钟），同步等结果。\n跑完会自动更新状态到「📋 日志」。`)) return;
   try {
     const r = await fetch("/api/jobs/run/" + encodeURIComponent(jobId), { method: "POST" });
     const data = await r.json();
-    // hermes cron run 是 fire-and-forget，可能超时但任务已经在跑
+    // ta-scheduler trigger 路径：同步等结果（10+ 分钟），完成后 state.db 写入状态
     if (data.ok) {
-      alert(`已触发：${name}\n\n${data.stdout || ''}`);
-    } else if (data.stderr && data.stderr.includes("timeout")) {
-      alert(`已触发（hermes cron run timeout，但任务在后台跑）：${name}\n\n去「📋 日志」看进度。`);
+      alert(`已跑完：${name}\n\n退出码 ${data.returncode}\n${(data.stdout || '').slice(-200)}`);
+    } else if (data.stderr && (data.stderr.includes("timeout") || data.stderr.includes("Timed out"))) {
+      alert(`ta-scheduler trigger 超时（但任务在后台跑）：${name}\n\n去「📋 日志」看进度。`);
     } else {
-      alert(`触发：${name}\n${JSON.stringify(data, null, 2)}`);
+      alert(`跑失败：${name}\n${JSON.stringify(data, null, 2).slice(0, 500)}`);
     }
   } catch (e) {
     alert("触发失败：" + e.message);
@@ -147,7 +155,11 @@ async function openLogsSheet(jobId, name) {
       if (s === 'unknown') return '<span class="pill yellow">未知</span>';
       return `<span class="pill">${escapeHtml(s)}</span>`;
     };
-    list.innerHTML = runs.map((run, idx) => `
+    list.innerHTML = runs.map((run, idx) => {
+      const isFailed = run.status === 'failed';
+      const hasError = run.error && run.error.trim();
+      const detailsId = `log-details-${idx}-${Math.random().toString(36).slice(2, 8)}`;
+      return `
       <div style="margin-bottom:8px; padding:10px; background: var(--bg-elev); border-radius: 6px;">
         <div class="row" style="margin-bottom:4px;">
           <strong style="font-size:13px;">${run.ts}</strong>
@@ -155,14 +167,36 @@ async function openLogsSheet(jobId, name) {
           <div class="spacer"></div>
           <span class="muted tiny">${run.source}</span>
         </div>
-        <div class="muted tiny">execution_id: ${escapeHtml(run.execution_id)}</div>
+        <div class="muted tiny">execution_id: ${escapeHtml(run.execution_id)}${run.duration_s ? ' · 用时 ' + run.duration_s.toFixed(1) + 's' : ''}${run.exit_code != null ? ' · exit=' + run.exit_code : ''}</div>
+        <div style="margin-top:6px;">
+          <button class="btn small secondary btn-load-full-log" data-load-full-log="${escapeHtml(run.execution_id)}" style="font-size:12px; padding:4px 10px;">
+            📜 看完整日志
+          </button>
+        </div>
+        ${hasError ? `
+        <details id="${detailsId}" style="margin-top:8px;">
+          <summary style="cursor:pointer; padding:4px 8px; background: var(--bg); border-radius: 4px; color: var(--red); font-size:12px;">
+            ⚠️ 失败摘要（点击展开）
+          </summary>
+          <pre style="background: var(--bg); padding:8px; border-radius: 4px; font-size: 11px; white-space: pre-wrap; word-wrap: break-word; margin-top:6px; max-height: 200px; overflow:auto; font-family: ui-monospace, Menlo, monospace;">${escapeHtml(run.error)}</pre>
+        </details>
+        ` : ''}
       </div>
-    `).join("");
+    `;
+    }).join("");
+
+    // 弹层渲染后，给 📜 按钮单独绑事件（不能用 forEach on document.querySelectorAll，否则弹层外也算）
+    list.querySelectorAll(".btn-load-full-log").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const runId = btn.dataset.loadFullLog;
+        openFullLogSheet(runId);
+      });
+    });
     // 顶部加说明
     const note = document.createElement("div");
     note.className = "muted small";
     note.style.marginBottom = "10px";
-    note.innerHTML = "💡 完整 stdout 由 hermes 直接送 deliver（飞书），本地不持久化。去飞书查具体输出。";
+    note.innerHTML = "💡 完整 stdout 写入 ta-scheduler 的 logs/scheduler.log。失败原因显示在卡片下方。";
     list.prepend(note);
   } catch (e) {
     list.innerHTML = `<div class="muted">加载失败：${e.message}</div>`;
@@ -171,6 +205,36 @@ async function openLogsSheet(jobId, name) {
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+
+// ===== 看完整日志弹层（从 /api/runs/<id>/log 拿完整 stdout）=====
+async function openFullLogSheet(runId) {
+  const overlay = document.createElement("div");
+  overlay.className = "sheet-overlay open";
+  overlay.innerHTML = `
+    <div class="sheet" onclick="event.stopPropagation()" style="max-height: 90vh;">
+      <h2>📜 完整日志 · ${runId}</h2>
+      <p class="muted small" style="margin-top:-8px;">从 ta-scheduler/logs/runs/<run_id>.log 读取</p>
+      <div id="full-log" class="muted small" style="max-height: 70vh; overflow:auto; background: var(--bg); padding:12px; border-radius: 6px; font-family: ui-monospace, Menlo, monospace; font-size: 11px; white-space: pre-wrap; word-wrap: break-word;">加载中…</div>
+      <button class="btn secondary" style="margin-top:12px;" onclick="this.closest('.sheet-overlay').remove()">关闭</button>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
+
+  const logDiv = overlay.querySelector("#full-log");
+  try {
+    const r = await fetch("/api/runs/" + encodeURIComponent(runId) + "/log?full=true");
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    const text = data.content || "(empty)";
+    logDiv.textContent = text.length > 50000
+      ? text.slice(0, 50000) + "\n\n... (截断到 50000 字符，完整日志在服务器文件里) ..."
+      : text;
+  } catch (e) {
+    logDiv.textContent = "❌ 加载失败：" + e.message;
+  }
 }
 
 async function runNowAndMonitor() {

@@ -179,6 +179,19 @@ def update_job_state(symbol: str, cron_expr: str, status: str, exit_code: Option
         )
 
 
+def _update_run_meta(symbol: str, run_id: str, log_path: Optional[str], exit_code: Optional[int], status: str) -> None:
+    """把每次 run 的 run_id + log_path 存到 job_state。
+    这样 H5 弹层可以告诉用户"看 logs/runs/<run_id>.log 看完整 stdout" """
+    if not log_path:
+        return
+    with _conn() as conn:
+        # 把旧字段 last_error 后面加 run_id + log_path（保持兼容）
+        conn.execute(
+            "UPDATE job_state SET last_error = COALESCE(last_error, '') || ? WHERE symbol = ?",
+            (f"\n[run_id={run_id}]\n[log_path={log_path}]\n[exit_code={exit_code}]", symbol),
+        )
+
+
 # ==================== Watchlist DB（共享 H5 SQLite）====================
 def read_watchlist() -> list[dict]:
     """从 H5 SQLite 读 enabled=1 的 watchlist"""
@@ -227,13 +240,15 @@ def should_run(symbol: str, cron_expr: str, now: datetime) -> bool:
     return True
 
 
-def run_one(symbol: str) -> tuple[str, int, float, Optional[str]]:
-    """跑一个 ticker。返回 (status, exit_code, duration_s, error)"""
+def run_one(symbol: str) -> tuple[str, str, int, float, Optional[str], Optional[str]]:
+    """跑一个 ticker。
+    返回 (status, run_id, exit_code, duration_s, error, log_path)
+    log_path 是这个 run 的完整 stdout 文件路径（H5 可读）
+    """
     log.info(f"[run] {symbol} START")
     start = time.time()
     venv_py = str(TA_DIR / ".venv" / "bin" / "python")
     run_batch_py = str(TA_DIR / "run_batch.py")
-    # bash 包装（source proxy + .env，跟 cron 一致）
     bash = (
         "set -uo pipefail\n"
         "unset PYTHONPATH PYTHONHOME LD_LIBRARY_PATH LD_PRELOAD VIRTUAL_ENV\n"
@@ -243,26 +258,52 @@ def run_one(symbol: str) -> tuple[str, int, float, Optional[str]]:
         "set +a\n"
         f'"{venv_py}" "{run_batch_py}" --tickers "{symbol}" --date "$(date \'+%Y-%m-%d\')"\n'
     )
+    # 持久化完整 stdout 到文件
+    run_id = datetime.now(tz=timezone(timedelta(hours=8))).strftime("%Y%m%d_%H%M%S") + "_" + symbol
+    runs_dir = Path(__file__).resolve().parent / "logs" / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = runs_dir / f"{run_id}.log"
+
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["/bin/bash", "-c", bash],
-            capture_output=True, text=True, timeout=1800,
-            cwd=str(TA_DIR),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=str(TA_DIR),
         )
+        # 实时写完整 stdout 到 log 文件
+        stdout_buf = []
+        with open(log_path, "w") as f:
+            f.write(f"# run_id={run_id}\n# symbol={symbol}\n# started_at={datetime.now(tz=timezone(timedelta(hours=8))).isoformat()}\n\n")
+            for line in proc.stdout:
+                f.write(line)
+                f.flush()
+                stdout_buf.append(line)
+        proc.wait()
         duration = round(time.time() - start, 1)
+
+        # 写退出码
+        with open(log_path, "a") as f:
+            f.write(f"\n# exit_code={proc.returncode}\n# duration_s={duration}\n# ended_at={datetime.now(tz=timezone(timedelta(hours=8))).isoformat()}\n")
+
         status = "completed" if proc.returncode == 0 else "failed"
         log.info(f"[run] {symbol} DONE exit={proc.returncode} duration={duration}s")
         if proc.returncode != 0:
-            log.warning(f"[run] {symbol} stderr (last 500): {proc.stderr[-500:]}")
-        return status, proc.returncode, duration, (proc.stderr[-300:] if proc.returncode != 0 else None)
+            err_tail = "".join(stdout_buf)[-500:]
+            log.warning(f"[run] {symbol} stderr tail (last 500): {err_tail}")
+            return status, run_id, proc.returncode, duration, err_tail, str(log_path)
+        return status, run_id, proc.returncode, duration, None, str(log_path)
     except subprocess.TimeoutExpired:
         duration = round(time.time() - start, 1)
         log.error(f"[run] {symbol} TIMEOUT after {duration}s")
-        return "failed", -1, duration, "timeout 1800s"
+        with open(log_path, "a") as f:
+            f.write(f"\n# exit_code=-1 (timeout)\n# duration_s={duration}\n")
+        return "failed", run_id, -1, duration, "timeout 1800s", str(log_path)
     except Exception as e:
         duration = round(time.time() - start, 1)
         log.exception(f"[run] {symbol} FAILED: {e}")
-        return "failed", -1, duration, str(e)
+        with open(log_path, "a") as f:
+            f.write(f"\n# spawn_error={e}\n")
+        return "failed", run_id, -1, duration, str(e), str(log_path)
 
 
 # ==================== Main loop ====================
@@ -287,8 +328,10 @@ def main() -> None:
                     cron_expr = get_cron_for_symbol(symbol)
                     if should_run(symbol, cron_expr, now):
                         log.info(f"[trigger] {symbol} cron={cron_expr}")
-                        status, exit_code, _, error = run_one(symbol)
+                        status, run_id, exit_code, _, error, log_path = run_one(symbol)
                         update_job_state(symbol, cron_expr, status, exit_code, _, error)
+                        # 把 run_id + log_path 也存到 state.db（下次能查完整日志）
+                        _update_run_meta(symbol, run_id, log_path, exit_code, status)
             tick_duration = time.time() - tick_start
             # sleep 到下一个整分钟
             sleep_for = max(5, 60 - tick_duration)

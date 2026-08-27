@@ -1,7 +1,7 @@
 """
 SQLite 持久化层
 ================
-只存可变状态：watchlist + jobs_state（jobs 实际数据来自 hermes cron，state 只存我们的 metadata 标签）
+只存可变状态：watchlist + jobs_state（jobs 实际数据来自 ta-scheduler 跑的 run_batch.py 输出）
 不用 SQLAlchemy，直接 sqlite3 stdlib，够用且零依赖。
 """
 import sqlite3
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS watchlist (
     tags TEXT,                     -- JSON array
     target_price REAL,
     stop_loss REAL,
-    cron_id TEXT,                     -- 关联的 hermes cron job_id（自动创建时填）
+    cron_id TEXT,                     -- 关联的 ta-scheduler job_id（自动创建时填）
     updated_at TEXT NOT NULL
 );
 

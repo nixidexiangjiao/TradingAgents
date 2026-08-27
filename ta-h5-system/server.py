@@ -372,20 +372,95 @@ def get_gateway(force: bool = False, _=Depends(require_auth)):
 
 @app.get("/api/jobs")
 def get_jobs(refresh: bool = False, _=Depends(require_auth)):
-    """列出 hermes cron 全部 job。refresh=true 强制重读（写操作后用）
-    返回 camelCase 别名，方便前端直接用"""
-    jobs = hermes_bridge.list_jobs(force=refresh)
+    """列出 ta-scheduler 跑的 jobs（合并 watchlist + state.db）。
+    完全分离：tradingagent 调度由 ta-scheduler 负责，跟 hermes 无关。
+
+    数据源：
+    - H5 watchlist.db  (enabled=1)：所有 ticker 列表（必有显示）
+    - ta-scheduler/state.db：每个 ticker 的最新运行状态（可选）
+
+    merge 逻辑：
+    - watchlist 里的 ticker 一定显示
+    - state.db 里的状态覆盖默认值（last_run=暂无, last_status=pending）
+    - 如果 ticker 在 state.db 但不在 watchlist（罕见）：也显示
+    """
+    import sqlite3
     out = []
-    for j in jobs:
-        row = dict(j)
-        # camelCase 别名
-        row["lastRun"] = j.get("last_run_ts") or j.get("next_run") or "暂无"
-        row["lastStatus"] = j.get("last_status") or "unknown"
-        row["lastStatusNote"] = j.get("last_status_note") or ""
-        row["cronId"] = j.get("id", "")[:12]
-        row["duration"] = "—"  # hermes 不存 duration
-        out.append(row)
+    seen = set()
+
+    # 1. 读 H5 watchlist（source of truth for ticker 列表）
+    watchlist = []
+    try:
+        wl_path = Path("/home/lzero/workspace/TradingAgents/ta-h5-system/data/ta_h5.db")
+        if wl_path.exists():
+            with sqlite3.connect(str(wl_path), timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+                for r in conn.execute("SELECT * FROM watchlist WHERE enabled=1 ORDER BY sort_order, symbol"):
+                    watchlist.append(dict(r))
+    except Exception as e:
+        log.warning(f"读 watchlist 失败: {e}")
+
+    # 2. 读 ta-scheduler state.db（运行状态）
+    state_map = {}  # symbol -> {last_run_ts, last_status, ...}
+    state_db = Path("/home/lzero/workspace/TradingAgents/ta-scheduler/state.db")
+    if state_db.exists():
+        try:
+            with sqlite3.connect(str(state_db), timeout=5) as conn:
+                conn.row_factory = sqlite3.Row
+                for r in conn.execute("SELECT * FROM job_state"):
+                    row = dict(r)
+                    state_map[row["symbol"]] = row
+        except Exception as e:
+            log.warning(f"读 ta-scheduler state.db 失败: {e}")
+
+    # 3. 合并
+    for w in watchlist:
+        symbol = w["symbol"]
+        seen.add(symbol)
+        s = state_map.get(symbol, {})
+        last_status = s.get("last_status") or "pending"  # 还没跑过 = pending
+        out.append({
+            "id": f"ta-sched-{symbol}",
+            "name": f"ta-batch-{symbol}",
+            "cronId": "ta-scheduler",
+            "schedule": s.get("cron_expr") or "30 21 * * 1-5",
+            "scope": symbol,
+            "status": "active",
+            "lastRun": s.get("last_run_ts") or "尚未运行",
+            "lastStatus": last_status,
+            "lastStatusNote": "" if last_status != "failed" else (s.get("last_error") or "")[:200],
+            "duration": f"{s['last_duration_s']:.1f}s" if s.get("last_duration_s") else "—",
+            "deliver": "local",
+            "script": "ta-scheduler/scheduler.py",
+        })
+
+    # 4. state.db 里但不在 watchlist 的 ticker（罕见，但显示）
+    for symbol, s in state_map.items():
+        if symbol in seen:
+            continue
+        out.append({
+            "id": f"ta-sched-{symbol}",
+            "name": f"ta-batch-{symbol}",
+            "cronId": "ta-scheduler",
+            "schedule": s.get("cron_expr") or "30 21 * * 1-5",
+            "scope": symbol,
+            "status": "active (not in watchlist)",
+            "lastRun": s.get("last_run_ts") or "—",
+            "lastStatus": s.get("last_status") or "unknown",
+            "lastStatusNote": "",
+            "duration": f"{s['last_duration_s']:.1f}s" if s.get("last_duration_s") else "—",
+            "deliver": "local",
+            "script": "ta-scheduler/scheduler.py",
+        })
+
     return {"jobs": out}
+
+
+# 保留老的 hermes cron list 端点（隐藏路径，不在 H5 看到）
+@app.get("/api/hermes/cron")
+def list_hermes_cron(_=Depends(require_auth)):
+    """列出 hermes cron 所有 jobs（调试用，不在 H5 暴露）"""
+    return {"jobs": hermes_bridge.list_jobs(force=True)}
 
 
 @app.get("/api/jobs/runs/{job_id}")
@@ -395,30 +470,153 @@ def get_job_runs(job_id: str, limit: int = 20, _=Depends(require_auth)):
 
 @app.post("/api/jobs/run/{job_id}")
 def run_job_now(job_id: str, _=Depends(require_auth)):
-    """立刻跑一个 hermes cron job。
-    ⚠️ 100% 复用 hermes：调 hermes cron run <id>，让 hermes 调度 + 执行 + 推送 deliver
-    H5 不自己 Popen script（避免重复实现 hermes 已有能力）
-    日志：hermes no-agent stdout 直接送到 deliver（飞书/telegram），本地拿不到完整 stdout。
-    H5 用 hermes cron runs 拿历史 status（status: completed/failed/running + ts）
+    """立刻跑一个定时任务。
+    - ta-sched-<symbol> → 走 ta-scheduler 的 trigger（直接 subprocess，不经过 hermes）
+    - 其它 → 走 hermes cron run <id>（保持原行为）
     """
-    log.info(f"POST /api/jobs/run/{job_id} → hermes cron run")
+    log.info(f"POST /api/jobs/run/{job_id}")
+    if job_id.startswith("ta-sched-"):
+        symbol = job_id[len("ta-sched-"):]
+        # 直接调 run_batch.py，绕过 hermes cron run
+        return _trigger_ta_scheduler_run(symbol)
     return hermes_bridge.run_now(job_id)
+
+
+def _trigger_ta_scheduler_run(symbol: str) -> dict:
+    """直接跑 run_batch.py --tickers <symbol>（绕过 hermes cron run）
+    返回同步结果（不异步，不像 hermes cron 那种 fire-and-forget）"""
+    import subprocess
+    run_batch = TA_DIR / "run_batch.py"
+    venv_py = TA_DIR / ".venv" / "bin" / "python"
+    bash = (
+        "set -uo pipefail\n"
+        "unset PYTHONPATH PYTHONHOME LD_LIBRARY_PATH LD_PRELOAD VIRTUAL_ENV\n"
+        "source /home/lzero/proxy.sh\n"
+        "set -a\n"
+        f'source "{TA_DIR}/.env"\n'
+        "set +a\n"
+        f'"{venv_py}" "{run_batch}" --tickers "{symbol}" --date "$(date \'+%Y-%m-%d\')"\n'
+    )
+    log.info(f"[trigger] ta-scheduler 直接跑 {symbol}")
+    try:
+        proc = subprocess.run(
+            ["/bin/bash", "-c", bash],
+            capture_output=True, text=True, timeout=1800,
+            cwd=str(TA_DIR),
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": (proc.stdout or "")[-500:],
+            "stderr": (proc.stderr or "")[-500:],
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "returncode": -1, "stderr": "timeout 1800s"}
+    except Exception as e:
+        return {"ok": False, "returncode": -1, "stderr": str(e)}
 
 
 # ==================== Run history (从 hermes 拿) ====================
 @app.get("/api/jobs/{job_id}/logs")
 def get_job_logs(job_id: str, limit: int = 5, _=Depends(require_auth)):
-    """拿某个 job 的最近 N 次执行历史（从 hermes cron runs 拿）
-    注意：hermes no-agent stdout 不持久化到本地，只送 deliver。日志要看完整内容得去飞书/Telegram。
+    """拿某个 job 的最近 N 次执行历史。
+    - ta-sched-<symbol> → 读 ta-scheduler state.db
+    - 其它（hermes 12位）→ 读 hermes cron runs
+
+    数据格式统一（jobs.js 通用）：
+    {ts, status, source, execution_id, duration_s, error}
     """
-    runs = hermes_bridge.get_runs(job_id, limit=limit)
-    return {"runs": runs, "note": "完整 stdout 在 deliver 渠道（飞书/Telegram）。本地只存 execution 历史。"}
+    runs = []
+    if job_id.startswith("ta-sched-"):
+        # ta-scheduler path
+        symbol = job_id[len("ta-sched-"):]
+        import sqlite3
+        state_db = Path("/home/lzero/workspace/TradingAgents/ta-scheduler/state.db")
+        if state_db.exists():
+            try:
+                with sqlite3.connect(str(state_db), timeout=5) as conn:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT * FROM job_state WHERE symbol=?", (symbol,)
+                    ).fetchone()
+                if row:
+                    r = dict(row)
+                    runs.append({
+                        "ts": r.get("last_run_ts") or "尚未运行",
+                        "status": r.get("last_status") or "pending",
+                        "source": "ta-scheduler",
+                        "execution_id": f"ta-sched-{symbol}",
+                        "duration_s": r.get("last_duration_s"),
+                        "exit_code": r.get("last_exit_code"),
+                        "error": (r.get("last_error") or "")[:300],
+                    })
+            except Exception as e:
+                log.warning(f"读 ta-scheduler state.db 失败: {e}")
+        note = "完整 stdout 写入 ta-scheduler 的 logs/scheduler.log。失败原因显示在卡片下方。"
+    else:
+        # hermes cron path
+        runs = hermes_bridge.get_runs(job_id, limit=limit)
+        note = "完整 stdout 在 deliver 渠道（飞书/Telegram）。本地只存 execution 历史。"
+    return {"runs": runs, "note": note}
 
 
 @app.get("/api/runs/{run_id}/log")
-def get_run_log(run_id: str, _=Depends(require_auth)):
-    """单次执行的日志（hermes no-agent 不持久化，404）"""
-    raise HTTPException(404, "hermes no-agent stdout 不持久化本地。请去飞书/Telegram 查 deliver 消息。")
+def get_run_log(run_id: str, full: bool = False, _=Depends(require_auth)):
+    """单次执行的日志。
+    - ta-sched-* → 读 ta-scheduler 完整 stdout 文件（logs/runs/<run_id>.log）
+    - 其它 → 404（hermes no-agent 不持久化本地）
+    """
+    if run_id.startswith("ta-sched-"):
+        # run_id 格式: YYYYMMDD_HHMMSS_<symbol> 或 YYYYMMDD_HHMMSS_ta-sched-<symbol>
+        # 找对应的日志文件
+        runs_dir = Path("/home/lzero/workspace/TradingAgents/ta-scheduler/logs/runs")
+        if not runs_dir.exists():
+            raise HTTPException(404, f"runs/ 目录不存在: {runs_dir}")
+
+        # 1. 直接精确匹配
+        exact = runs_dir / f"{run_id}.log"
+        if exact.exists():
+            content = exact.read_text(errors="replace")
+            return _format_run_log_response(run_id, content, full)
+
+        # 2. run_id 可能带 ta-sched- 前缀或没带，模糊匹配
+        # 例如 "ta-sched-0700.HK" → 找包含 "0700.HK" 的最新 .log
+        symbol_hint = run_id.replace("ta-sched-", "").split("_")[-1] if "ta-sched-" in run_id else run_id.split("_")[-1]
+        candidates = sorted(runs_dir.glob(f"*_{symbol_hint}.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            content = candidates[0].read_text(errors="replace")
+            return _format_run_log_response(candidates[0].stem, content, full)
+
+        # 3. 兜底：从 state.db 找 last_error
+        import sqlite3
+        state_db = Path("/home/lzero/workspace/TradingAgents/ta-scheduler/state.db")
+        if state_db.exists():
+            try:
+                with sqlite3.connect(str(state_db), timeout=5) as conn:
+                    conn.row_factory = sqlite3.Row
+                    for row in conn.execute("SELECT * FROM job_state"):
+                        if symbol_hint in (row["symbol"] or ""):
+                            r = dict(row)
+                            content = (
+                                f"# run_id={run_id}\n"
+                                f"# symbol={r.get('symbol')}\n"
+                                f"# cron={r.get('cron_expr')}\n"
+                                f"# last_run_ts={r.get('last_run_ts')}\n"
+                                f"# last_status={r.get('last_status')}\n"
+                                f"# last_exit_code={r.get('last_exit_code')}\n"
+                                f"# last_duration_s={r.get('last_duration_s')}\n\n"
+                                f"# last_error (truncated to 5000):\n{(r.get('last_error') or '(none)')[:5000]}"
+                            )
+                            return _format_run_log_response(run_id, content, full)
+            except Exception as e:
+                log.warning(f"读 state.db 失败: {e}")
+        raise HTTPException(404, f"找不到 {run_id} 对应的日志文件")
+
+
+def _format_run_log_response(run_id: str, content: str, full: bool) -> dict:
+    if not full:
+        content = content[-2000:] if len(content) > 2000 else content
+    return {"run_id": run_id, "content": content, "size": len(content)}
 
 
 @app.post("/api/jobs/create")
