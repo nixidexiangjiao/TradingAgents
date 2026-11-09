@@ -24,6 +24,7 @@ from tradingagents.agents.utils.agent_states import AgentState
 
 from .analyst_execution import build_analyst_execution_plan
 from .conditional_logic import ConditionalLogic
+from .sensitive_retry import with_sensitive_retry
 
 # Every target a shared conditional router can return. Each edge driven by the
 # router maps all of them, so a fall-through return (e.g. under prompt/i18n/
@@ -96,19 +97,21 @@ class GraphSetup:
 
         # Add analyst nodes to the graph
         for spec in plan.specs:
-            workflow.add_node(spec.agent_node, analyst_factories[spec.key]())
+            # 内容审核拦截（MiniMax 1027）是偶发的，分析师写长报告时容易触发。
+            # 包装一层：被拦时追加"保持中立"的提示后重跑一次。
+            workflow.add_node(spec.agent_node, with_sensitive_retry(analyst_factories[spec.key]()))
             workflow.add_node(spec.clear_node, create_msg_delete())
             workflow.add_node(spec.tool_node, self.tool_nodes[spec.key])
 
         # Add other nodes
-        workflow.add_node("Bull Researcher", bull_researcher_node)
-        workflow.add_node("Bear Researcher", bear_researcher_node)
-        workflow.add_node("Research Manager", research_manager_node)
-        workflow.add_node("Trader", trader_node)
-        workflow.add_node("Aggressive Analyst", aggressive_analyst)
-        workflow.add_node("Neutral Analyst", neutral_analyst)
-        workflow.add_node("Conservative Analyst", conservative_analyst)
-        workflow.add_node("Portfolio Manager", portfolio_manager_node)
+        workflow.add_node("Bull Researcher", with_sensitive_retry(bull_researcher_node))
+        workflow.add_node("Bear Researcher", with_sensitive_retry(bear_researcher_node))
+        workflow.add_node("Research Manager", with_sensitive_retry(research_manager_node))
+        workflow.add_node("Trader", with_sensitive_retry(trader_node))
+        workflow.add_node("Aggressive Analyst", with_sensitive_retry(aggressive_analyst))
+        workflow.add_node("Neutral Analyst", with_sensitive_retry(neutral_analyst))
+        workflow.add_node("Conservative Analyst", with_sensitive_retry(conservative_analyst))
+        workflow.add_node("Portfolio Manager", with_sensitive_retry(portfolio_manager_node))
 
         # Define edges
         # Start with the first analyst

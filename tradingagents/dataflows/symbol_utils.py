@@ -101,6 +101,21 @@ def _normalize_crypto(s: str) -> str | None:
     return f"{base}-USD" if base else None
 
 
+# Hong Kong Exchange codes are 5 digits, zero-padded (00700 = Tencent,
+# 09988 = Alibaba). Yahoo quotes them as 4 digits + ".HK" (0700.HK), so a
+# raw "00700" returns an empty result and the agents see no price at all.
+_HK_STOCK_RE = re.compile(r"^\d{4,5}$")
+
+
+def _is_hk_stock(s: str) -> bool:
+    """True for a bare Hong Kong stock code (4-5 digits, zero-padded).
+
+    Only bare numeric codes qualify — anything already carrying an exchange
+    suffix (e.g. ``0700.HK``, ``600519.SS``) is left untouched.
+    """
+    return bool(_HK_STOCK_RE.fullmatch(s))
+
+
 def normalize_symbol(raw: str) -> str:
     """Map a user/broker symbol to its canonical Yahoo Finance symbol.
 
@@ -128,6 +143,9 @@ def normalize_symbol(raw: str) -> str:
         canonical = _ALIASES[s]
     elif crypto is not None:
         canonical = crypto
+    elif _is_hk_stock(s):
+        # 港交所 5 位代码：00700 -> 0700.HK, 09988 -> 9988.HK
+        canonical = f"{int(s):04d}.HK"
     elif len(s) == 6 and s[:3] in _FOREX_CURRENCIES and s[3:] in _FOREX_CURRENCIES:
         canonical = f"{s}=X"
     else:
