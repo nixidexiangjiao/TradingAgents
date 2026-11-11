@@ -183,6 +183,14 @@ class TradingAgentsGraph:
         if max_retries is not None and max_retries != "":
             kwargs["max_retries"] = _coerce_max_retries(max_retries)
 
+        # Per-request timeout. The OpenAI SDK defaults to *no* timeout, so a
+        # provider that accepts a request and never answers blocks the calling
+        # thread forever — which also stalls every worker queued behind it.
+        # Bound it so a hung provider surfaces as a failed run instead.
+        timeout = self.config.get("llm_timeout")
+        if timeout is not None and timeout != "":
+            kwargs["timeout"] = float(timeout)
+
         return kwargs
 
     def _create_tool_nodes(self) -> dict[str, ToolNode]:
